@@ -1,0 +1,303 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  ChatOpsBot - AWS alerts and operations in Slack (Operational Excellence Pillar).
+  CloudWatch alarm -> SNS -> Amazon Q Developer in chat applications -> Slack,
+  an ops Lambda that can be invoked from Slack, IAM guardrails, a test EC2 instance,
+  and an S3 + CloudFront status dashboard. Package with `aws cloudformation package` (see README).
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: chatopsbot
+    AllowedPattern: "^[a-z0-9-]+$"
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Optional. Email address that also receives alarm notifications.
+  SlackWorkspaceId:
+    Type: String
+    Default: ""
+    Description: >
+      Optional. Slack workspace (team) ID, e.g. T0123ABCD. The workspace must first be
+      authorised once in the Amazon Q Developer in chat applications console. Leave blank to skip Slack.
+  SlackChannelId:
+    Type: String
+    Default: ""
+    Description: Slack channel ID, e.g. C0123ABCD (right-click the channel > View channel details).
+  CpuThreshold:
+    Type: Number
+    Default: 70
+    MinValue: 1
+    MaxValue: 100
+    Description: CPU % that triggers the alarm.
+  InstanceType:
+    Type: String
+    Default: t3.micro
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Conditions:
+  HasEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+  HasSlack: !And
+    - !Not [!Equals [!Ref SlackWorkspaceId, ""]]
+    - !Not [!Equals [!Ref SlackChannelId, ""]]
+
+Resources:
+  # ---------------------------------------------------------------- Alerting
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-slack-alerts-topic"
+
+  AlertsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref AlertsTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudWatchAlarms
+            Effect: Allow
+            Principal: { Service: cloudwatch.amazonaws.com }
+            Action: sns:Publish
+            Resource: !Ref AlertsTopic
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail          # confirm the subscription from your inbox
+
+  # ---------------------------------------------------------------- Test workload
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore   # Session Manager, no SSH key needed
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  TestInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ChatOpsBot test instance - no inbound access (use Session Manager)
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+
+  TestInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      SecurityGroupIds: [!GetAtt TestInstanceSecurityGroup.GroupId]
+      Monitoring: true                    # 1-minute metrics so the alarm fires quickly
+      MetadataOptions:
+        HttpTokens: required              # IMDSv2 only
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          dnf install -y stress-ng
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-test-instance"
+
+  HighCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-high-cpu"
+      AlarmDescription: !Sub "CPU above ${CpuThreshold}% on the ChatOpsBot test instance"
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref TestInstance
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: !Ref CpuThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopic]
+      OKActions: [!Ref AlertsTopic]         # tell the channel when it recovers too
+
+  # ---------------------------------------------------------------- Ops Lambda (invoked from Slack)
+  OpsFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ReadOpsStatus
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:DescribeAlarms
+                  - ec2:DescribeInstanceStatus
+                Resource: "*"           # these Describe APIs don't support resource-level permissions
+
+  OpsStatusFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-ops-status"
+      Description: Returns a status summary (alarms in ALARM state, instance health). Invoke from Slack.
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: handler.lambda_handler
+      Code: ../lambda/ops-status            # uploaded by `aws cloudformation package`
+      Role: !GetAtt OpsFunctionRole.Arn
+      Timeout: 15
+      MemorySize: 128
+      Environment:
+        Variables:
+          ALARM_PREFIX: !Ref ProjectName
+
+  OpsStatusLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${OpsStatusFunction}"
+      RetentionInDays: 14
+
+  # ---------------------------------------------------------------- Slack integration (optional)
+  # Guardrail: the most anything run from the channel can ever do, whatever the channel role allows.
+  InvokeOpsFunctionPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Allow Slack users to invoke only the ChatOpsBot ops function
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: lambda:InvokeFunction
+            Resource: !GetAtt OpsStatusFunction.Arn
+
+  ChatbotChannelRole:
+    Type: AWS::IAM::Role
+    Condition: HasSlack
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: chatbot.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/ReadOnlyAccess
+        - !Ref InvokeOpsFunctionPolicy
+
+  SlackChannel:
+    Type: AWS::Chatbot::SlackChannelConfiguration
+    Condition: HasSlack
+    Properties:
+      ConfigurationName: !Sub "${ProjectName}-slack"
+      SlackWorkspaceId: !Ref SlackWorkspaceId
+      SlackChannelId: !Ref SlackChannelId
+      IamRoleArn: !GetAtt ChatbotChannelRole.Arn
+      SnsTopicArns: [!Ref AlertsTopic]
+      GuardrailPolicies:
+        - arn:aws:iam::aws:policy/ReadOnlyAccess
+        - !Ref InvokeOpsFunctionPolicy
+      LoggingLevel: INFO
+      UserRoleRequired: false
+
+  # ---------------------------------------------------------------- Dashboard (S3 + CloudFront)
+  DashboardBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:      # private bucket; only CloudFront can read it
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+
+  DashboardOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${ProjectName}-dashboard-oac-${AWS::Region}"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  DashboardDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: ChatOpsBot status dashboard
+        DefaultRootObject: index.html
+        PriceClass: PriceClass_100
+        HttpVersion: http2and3
+        Origins:
+          - Id: DashboardS3Origin
+            DomainName: !GetAtt DashboardBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt DashboardOAC.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: DashboardS3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6   # AWS managed: CachingOptimized
+          AllowedMethods: [GET, HEAD]
+          Compress: true
+
+  DashboardBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DashboardBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontOACRead
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub "${DashboardBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${DashboardDistribution}"
+
+Outputs:
+  AlertsTopicArn:
+    Value: !Ref AlertsTopic
+  TestInstanceId:
+    Description: Connect with Session Manager and run `stress-ng --cpu 2 --timeout 300` to trigger the alarm.
+    Value: !Ref TestInstance
+  OpsFunctionName:
+    Description: "From Slack: @Amazon Q lambda invoke --function-name <this> --region <region>"
+    Value: !Ref OpsStatusFunction
+  DashboardBucketName:
+    Description: Upload dashboard/index.html here (scripts/deploy.sh does this).
+    Value: !Ref DashboardBucket
+  DashboardUrl:
+    Value: !Sub "https://${DashboardDistribution.DomainName}"
